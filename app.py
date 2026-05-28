@@ -217,11 +217,30 @@ class App(tk.Tk):
         self.canvas.delete("all")
         self.canvas.create_image(0, 0, anchor="nw", image=photo)
 
+    def _start_timer(self):
+        import time
+        self._timer_start = time.time()
+        self._timer_running = True
+        self._tick_timer()
+
+    def _tick_timer(self):
+        if not self._timer_running:
+            return
+        import time
+        elapsed = int(time.time() - self._timer_start)
+        self._set_status(f"Analyse en cours… {elapsed}s")
+        self._timer_id = self.after(1000, self._tick_timer)
+
+    def _stop_timer(self):
+        self._timer_running = False
+        if hasattr(self, "_timer_id"):
+            self.after_cancel(self._timer_id)
+
     def _analyze(self):
         if not self.current_file:
             messagebox.showwarning("Aucun fichier", "Ouvrez d'abord un plan.")
             return
-        self._set_status("Analyse en cours…")
+        self._start_timer()
         threading.Thread(target=self._run_analysis, daemon=True).start()
 
     def _run_analysis(self):
@@ -250,9 +269,15 @@ class App(tk.Tk):
                     source += " — aucun élément trouvé (éditez manuellement)"
 
             self.items = items
+            self.after(0, self._stop_timer)
             self.after(0, lambda: self._populate_tree(items, source))
         except Exception as e:
-            self.after(0, lambda: self._set_status(f"Erreur : {e}"))
+            self.after(0, self._stop_timer)
+            self.after(0, lambda: self._set_status(f"Échec de l'analyse : {e} — Veuillez réessayer."))
+            self.after(0, lambda: messagebox.showerror(
+                "Analyse échouée",
+                f"Une erreur est survenue :\n{e}\n\nVeuillez réessayer ou choisir un autre fichier."
+            ))
 
     def _populate_tree(self, items, source=""):
         self.tree.delete(*self.tree.get_children())
