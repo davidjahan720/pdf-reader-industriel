@@ -72,9 +72,10 @@ class App(tk.Tk):
                   bg=ACCENT, fg="white",
                   command=self._open_file, **btn_style).pack(side="left", padx=(20,4))
 
-        tk.Button(top, text="⚡  Analyser",
+        self.btn_analyze = tk.Button(top, text="⚡  Analyser",
                   bg="#45475a", fg=TEXT,
-                  command=self._analyze, **btn_style).pack(side="left", padx=4)
+                  command=self._analyze, **btn_style)
+        self.btn_analyze.pack(side="left", padx=4)
 
         tk.Button(top, text="💾  Exporter Excel",
                   bg=GREEN, fg="#1e1e2e",
@@ -229,17 +230,20 @@ class App(tk.Tk):
         import time
         elapsed = int(time.time() - self._timer_start)
         self._set_status(f"Analyse en cours… {elapsed}s")
+        self.btn_analyze.config(text=f"⏳  Analyse… {elapsed}s")
         self._timer_id = self.after(1000, self._tick_timer)
 
     def _stop_timer(self):
         self._timer_running = False
         if hasattr(self, "_timer_id"):
             self.after_cancel(self._timer_id)
+        self.btn_analyze.config(text="⚡  Analyser", state="normal")
 
     def _analyze(self):
         if not self.current_file:
             messagebox.showwarning("Aucun fichier", "Ouvrez d'abord un plan.")
             return
+        self.btn_analyze.config(text="⏳  Analyse… 0s", state="disabled")
         self._start_timer()
         threading.Thread(target=self._run_analysis, daemon=True).start()
 
