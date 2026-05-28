@@ -261,8 +261,12 @@ class App(tk.Tk):
                 items = extract_from_pdf(path)
                 source = "PDF (texte vectoriel)"
                 if not items:
+                    self.after(0, lambda: self._set_status(
+                        "⚠️ Ce document ne contient pas de texte vectoriel "
+                        "(image rasterisée ou capture d'écran) — OCR en cours…"
+                    ))
                     items = extract_from_image(path, from_pdf=True)
-                    source = "PDF (OCR EasyOCR)"
+                    source = "PDF image (OCR EasyOCR)"
 
             if not items:
                 name = os.path.basename(path).lower()
@@ -294,7 +298,8 @@ class App(tk.Tk):
         ndim = len([x for x in items if x.get("type") != "gdt"])
         ngdt = len([x for x in items if x.get("type") == "gdt"])
         self.lbl_count.config(text=f"{ndim} cotes · {ngdt} GD&T")
-        self._set_status(f"Extraction {source} : {len(items)} éléments trouvés")
+        note = " — document image, vérifiez et complétez manuellement" if "OCR" in source else ""
+        self._set_status(f"Extraction {source} : {len(items)} éléments trouvés{note}")
 
     def _export_excel(self):
         if not self.items:
