@@ -70,8 +70,10 @@ def extract_from_image(path, from_pdf=False):
         pix  = page.get_pixmap(matrix=mat, alpha=False)
         import tempfile
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-        pix.save(tmp.name)
-        img_path = tmp.name
+        tmp_name = tmp.name
+        tmp.close()  # fermer avant écriture (nécessaire sur Windows)
+        pix.save(tmp_name)
+        img_path = tmp_name
     else:
         img_path = path
 
@@ -79,11 +81,13 @@ def extract_from_image(path, from_pdf=False):
 
     import tempfile, cv2
     tmp2 = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-    cv2.imwrite(tmp2.name, proc)
+    tmp2_name = tmp2.name
+    tmp2.close()  # fermer avant écriture (nécessaire sur Windows)
+    cv2.imwrite(tmp2_name, proc)
 
     reader  = _get_reader()
     results = reader.readtext(
-        tmp2.name,
+        tmp2_name,
         rotation_info=[90, 180, 270],
         paragraph=False,
         text_threshold=0.5,
@@ -98,7 +102,7 @@ def extract_from_image(path, from_pdf=False):
             words.append({"text": _correct(text), "x": x, "y": y, "conf": conf})
 
     # Nettoyage fichiers temp
-    os.unlink(tmp2.name)
+    os.unlink(tmp2_name)
     if from_pdf:
         os.unlink(img_path)
 

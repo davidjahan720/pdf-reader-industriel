@@ -1,226 +1,31 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-app.py — Interface graphique extraction de cotes plans industriels
+app.py — Interface graphique extraction de cotes plans industriels (v2 Tkinter)
 """
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
-import threading, os, re, json, glob
-from PIL import Image, ImageTk, ImageFilter, ImageEnhance
-import fitz        # pymupdf
-import xlrd, xlwt
-from xlutils.copy import copy as xl_copy
+import threading, os, glob
+from PIL import Image, ImageTk
+import fitz  # pymupdf
+
+from core.parser import parse_token
+from core.pdf    import extract_from_pdf
+from core.dxf    import extract_from_dxf
+from core.ocr    import extract_from_image
+from core.excel  import write_excel
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 
-# ── TABLE ISO 286 (source : reference_gdt.txt) ───────────────────────────────
-# Structure : { "ZONE": { (borne_inf, borne_sup): (ES, EI) } }
-ISO_TABLE = {
-    "H6":  {(0,3):(+0.006,0),(3,6):(+0.008,0),(6,10):(+0.009,0),(10,18):(+0.011,0),
-            (18,30):(+0.013,0),(30,50):(+0.016,0),(50,80):(+0.019,0),(80,120):(+0.022,0),(120,180):(+0.025,0),(180,250):(+0.029,0)},
-    "H7":  {(0,3):(+0.010,0),(3,6):(+0.012,0),(6,10):(+0.015,0),(10,18):(+0.018,0),
-            (18,30):(+0.021,0),(30,50):(+0.025,0),(50,80):(+0.030,0),(80,120):(+0.035,0),(120,180):(+0.040,0),(180,250):(+0.046,0)},
-    "H8":  {(0,3):(+0.014,0),(3,6):(+0.018,0),(6,10):(+0.022,0),(10,18):(+0.027,0),
-            (18,30):(+0.033,0),(30,50):(+0.039,0),(50,80):(+0.046,0),(80,120):(+0.054,0),(120,180):(+0.063,0),(180,250):(+0.072,0)},
-    "H9":  {(0,3):(+0.025,0),(3,6):(+0.030,0),(6,10):(+0.036,0),(10,18):(+0.043,0),
-            (18,30):(+0.052,0),(30,50):(+0.062,0),(50,80):(+0.074,0),(80,120):(+0.087,0),(120,180):(+0.100,0),(180,250):(+0.115,0)},
-    "h6":  {(0,3):(0,-0.006),(3,6):(0,-0.008),(6,10):(0,-0.009),(10,18):(0,-0.011),
-            (18,30):(0,-0.013),(30,50):(0,-0.016),(50,80):(0,-0.019),(80,120):(0,-0.022),(120,180):(0,-0.025),(180,250):(0,-0.029)},
-    "h7":  {(0,3):(0,-0.010),(3,6):(0,-0.012),(6,10):(0,-0.015),(10,18):(0,-0.018),
-            (18,30):(0,-0.021),(30,50):(0,-0.025),(50,80):(0,-0.030),(80,120):(0,-0.035),(120,180):(0,-0.040),(180,250):(0,-0.046)},
-    "g6":  {(3,6):(-0.004,-0.012),(6,10):(-0.005,-0.014),(10,18):(-0.006,-0.017),
-            (18,30):(-0.007,-0.020),(30,50):(-0.009,-0.025),(50,80):(-0.010,-0.029)},
-    "f7":  {(3,6):(-0.010,-0.022),(6,10):(-0.013,-0.028),(10,18):(-0.016,-0.034),
-            (18,30):(-0.020,-0.041),(30,50):(-0.025,-0.050),(50,80):(-0.030,-0.060)},
-}
-
-GDT_SYMBOLS = {
-    "planeite":       "⏥",
-    "rectitude":      "—",
-    "circularite":    "○",
-    "cylindricite":   "⌭",
-    "parallelisme":   "∥",
-    "perpendicularite": "⊥",
-    "angularite":     "∠",
-    "position":       "⊕",
-    "concentricite":  "◎",
-    "symetrie":       "≡",
-    "battement":      "↗",
-    "battement_total":"↗↗",
-    "profil_ligne":   "⌒",
-    "profil_surface": "⌓",
-}
-
-def iso_tolerance(diam, zone):
-    tbl = ISO_TABLE.get(zone, {})
-    for (lo, hi), (es, ei) in tbl.items():
-        if lo < diam <= hi or (lo == 0 and diam <= hi):
-            es_str = (f"+{es:.3f}" if es >= 0 else f"{es:.3f}").rstrip("0").rstrip(".")
-            ei_str = (f"+{ei:.3f}" if ei >= 0 else f"{ei:.3f}").rstrip("0").rstrip(".")
-            if es_str in ("+0", "0", ""): es_str = "+0"
-            if ei_str in ("+0", "0", "-0", ""): ei_str = "+0" if ei == 0 else ei_str
-            return es_str, ei_str
-    return None, None
-
-
-# ── EXTRACTION PDF (texte vectoriel + fallback visuel) ───────────────────────
-def extract_from_pdf(pdf_path):
-    """Tente l'extraction texte PyMuPDF, sinon retourne liste vide."""
-    items = []
-    doc = fitz.open(pdf_path)
-    for page in doc:
-        words = page.get_text("words")
-        for w in words:
-            text = w[4].strip()
-            item = parse_token(text)
-            if item:
-                item["x"] = w[0]
-                item["y"] = w[1]
-                items.append(item)
-    return items
-
-
-def extract_from_dxf(dxf_path):
-    """Extrait les entités DIMENSION et TEXT d'un DXF coté."""
-    import ezdxf
-    items = []
-    doc = ezdxf.readfile(dxf_path)
-    msp = doc.modelspace()
-    for e in msp:
-        if e.dxftype() == "DIMENSION":
-            try:
-                val = e.dxf.actual_measurement
-                txt = e.dxf.get("text", "").strip()
-                item = parse_token(txt) if txt else None
-                if item is None and val and val > 0:
-                    item = {"type": "dim", "valeur": round(val, 3), "label": str(round(val, 3))}
-                if item:
-                    items.append(item)
-            except Exception:
-                pass
-        elif e.dxftype() in ("TEXT", "MTEXT"):
-            try:
-                txt = (e.dxf.text if e.dxftype() == "TEXT" else e.text).strip()
-                item = parse_token(txt)
-                if item:
-                    items.append(item)
-            except Exception:
-                pass
-    return items
-
-
-def parse_token(t):
-    """Classifie un token texte en item structuré."""
-    t = t.strip()
-    if not t:
-        return None
-
-    # Normalisation symboles OCR → Unicode
-    t = t.replace("//", "∥")
-
-    # GD&T frames : ⊕ ∥ ⏥ ⌭ ⊥ ∠ ◎ ≡
-    if any(sym in t for sym in ["⊕", "∥", "⏥", "⌭", "⊥", "∠", "◎", "≡", "↗", "⌒", "⌓"]):
-        return {"type": "gdt", "label": t, "valeur": None}
-
-    # Rugosité Ra / Rz
-    m = re.match(r'^R[azpAZP]\s*(\d+\.?\d*)$', t)
-    if m:
-        param = t[:2].upper()
-        return {"type": "rugosite", "valeur": float(m.group(1)), "label": f"{param}{m.group(1)}"}
-
-    # Fit ISO : 40H7 / 8.2 H8 / 25h6
-    m = re.match(r'^(\d+\.?\d*)\s*([A-Za-z]\d+)$', t)
-    if m:
-        diam = float(m.group(1))
-        zone = m.group(2)
-        item = {"type": "iso_fit", "valeur": diam, "fit": zone}
-        es, ei = iso_tolerance(diam, zone.upper() if zone[0].isupper() else zone)
-        if es is None:
-            es, ei = iso_tolerance(diam, zone)
-        if es:
-            item["es"], item["ei"] = es, ei
-            item["label"] = f"{int(diam) if diam == int(diam) else diam} {zone} {es} {ei}"
-        else:
-            item["label"] = f"{int(diam) if diam == int(diam) else diam} {zone}"
-        return item
-
-    # Rayon
-    m = re.match(r'^[Rr](\d+\.?\d*)$', t)
-    if m:
-        v = float(m.group(1))
-        return {"type": "rayon", "valeur": v, "label": f"R{v}"}
-
-    # Angle
-    m = re.match(r'^(\d+\.?\d*)°$', t)
-    if m:
-        v = float(m.group(1))
-        return {"type": "angle", "valeur": v, "label": f"{int(v) if v == int(v) else v}°"}
-
-    # Dimension simple
-    m = re.match(r'^(\d+\.?\d*)$', t)
-    if m:
-        v = float(m.group(1))
-        if 0.5 <= v <= 9999:
-            return {"type": "dim", "valeur": v, "label": str(int(v) if v == int(v) else v)}
-
-    return None
-
-
-def extract_from_image(img_path):
-    """
-    OCR amélioré pour images scannées :
-    Méthode A (prétraitement avancé) + B (multi-zones/PSM) + C (multi-rotation).
-    """
-    try:
-        from ocr_engine import extract_combined
-        words = extract_combined(img_path)
-
-        items = []
-        seen_labels = set()
-        for w in words:
-            item = parse_token(w["text"])
-            if item:
-                lbl = item.get("label", "")
-                if lbl not in seen_labels:
-                    seen_labels.add(lbl)
-                    item["x"] = w.get("x", 0)
-                    item["y"] = w.get("y", 0)
-                    items.append(item)
-
-        items.sort(key=lambda it: (it.get("y", 9999) // 30, it.get("x", 0)))
-        return items
-
-    except Exception as e:
-        return []
-
 
 def render_pdf_page(pdf_path, width=500):
-    """Rend la première page PDF en image PIL redimensionnée."""
     doc  = fitz.open(pdf_path)
     page = doc[0]
     zoom = width / page.rect.width
     mat  = fitz.Matrix(zoom, zoom)
     pix  = page.get_pixmap(matrix=mat, alpha=False)
     return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-
-
-def write_excel(items, xls_path):
-    rb  = xlrd.open_workbook(xls_path, formatting_info=True)
-    wb  = xl_copy(rb)
-    ws  = wb.get_sheet(0)
-    row = 14
-    for item in items:
-        ws.write(row, 1, item.get("label", ""))
-        if item.get("type") == "gdt":
-            obs = json.dumps({"symbole": item.get("symbole", item.get("label","")),
-                              "valeur": item.get("valeur"), "cadre": True},
-                             ensure_ascii=False)
-            ws.write(row, 8, obs)
-        row += 2
-    out = xls_path.replace(".xls", "_rempli.xls")
-    wb.save(out)
-    return out
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -431,15 +236,18 @@ class App(tk.Tk):
                 source = f"OCR image ({ext.lstrip('.')})"
             else:
                 items = extract_from_pdf(path)
-                source = "PDF (texte)"
+                source = "PDF (texte vectoriel)"
+                if not items:
+                    items = extract_from_image(path, from_pdf=True)
+                    source = "PDF (OCR EasyOCR)"
 
             if not items:
                 name = os.path.basename(path).lower()
                 if "bride" in name:
                     items = BRIDE_FALLBACK.copy()
-                    source = "visuel (bride.pdf)"
+                    source = "fallback visuel (bride.pdf)"
                 else:
-                    source += " — aucun texte trouvé, liste vide (éditez manuellement)"
+                    source += " — aucun élément trouvé (éditez manuellement)"
 
             self.items = items
             self.after(0, lambda: self._populate_tree(items, source))
