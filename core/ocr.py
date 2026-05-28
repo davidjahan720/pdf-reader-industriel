@@ -1,4 +1,4 @@
-import os, ssl
+import os, ssl, tempfile, re
 import cv2
 import numpy as np
 from PIL import Image
@@ -6,7 +6,6 @@ import fitz
 
 ssl._create_default_https_context = ssl._create_unverified_context
 
-# Détection GPU
 import torch
 GPU_AVAILABLE = torch.cuda.is_available()
 
@@ -16,12 +15,18 @@ def _get_reader():
     global _reader
     if _reader is None:
         import easyocr
-        _reader = easyocr.Reader(
-            ["fr", "en"],
-            gpu=GPU_AVAILABLE,
-            verbose=False,
-        )
+        _reader = easyocr.Reader(["fr", "en"], gpu=GPU_AVAILABLE, verbose=False)
     return _reader
+
+
+def _pdf_to_image(pdf_path, zoom=5):
+    doc  = fitz.open(pdf_path)
+    page = doc[0]
+    pix  = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+    tmp  = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+    tmp.close()
+    pix.save(tmp.name)
+    return tmp.name
 
 
 def _preprocess(img_path):
@@ -31,8 +36,8 @@ def _preprocess(img_path):
         img = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2BGR)
 
     h, w = img.shape[:2]
-    if w < 2500:
-        scale = 2500 / w
+    if w < 3000:
+        scale = 3000 / w
         img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -53,7 +58,7 @@ def _preprocess(img_path):
                 gray = cv2.warpAffine(gray, M, (gray.shape[1], gray.shape[0]),
                                       flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
 
-    gray = cv2.fastNlMeansDenoising(gray, h=10)
+    gray = cv2.fastNlMeansDenoising(gray, h=8)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     gray = clahe.apply(gray)
     binary = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -62,49 +67,48 @@ def _preprocess(img_path):
     return cv2.dilate(binary, kernel, iterations=1)
 
 
+def _run_ocr(img_path, conf_threshold=0.25):
+    reader  = _get_reader()
+    results = reader.readtext(
+        img_path,
+        rotation_info=[90, 180, 270],
+        paragraph=False,
+        text_threshold=0.4,
+        low_text=0.25,
+    )
+    words = []
+    for (bbox, text, conf) in results:
+        if conf > conf_threshold:
+            words.append({
+                "text": _correct(text),
+                "x": bbox[0][0],
+                "y": bbox[0][1],
+                "conf": conf,
+            })
+    return words
+
+
 def extract_from_image(path, from_pdf=False):
+    raw_path = None
     if from_pdf:
-        doc  = fitz.open(path)
-        page = doc[0]
-        mat  = fitz.Matrix(3, 3)
-        pix  = page.get_pixmap(matrix=mat, alpha=False)
-        import tempfile
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-        tmp_name = tmp.name
-        tmp.close()  # fermer avant écriture (nécessaire sur Windows)
-        pix.save(tmp_name)
-        img_path = tmp_name
+        raw_path = _pdf_to_image(path, zoom=5)
+        img_path = raw_path
     else:
         img_path = path
 
+    # Passe 1 : image brute (haute résolution)
+    words = _run_ocr(img_path)
+
+    # Passe 2 : image prétraitée (contraste, binarisation)
     proc = _preprocess(img_path)
-
-    import tempfile, cv2
     tmp2 = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
-    tmp2_name = tmp2.name
-    tmp2.close()  # fermer avant écriture (nécessaire sur Windows)
-    cv2.imwrite(tmp2_name, proc)
+    tmp2.close()
+    cv2.imwrite(tmp2.name, proc)
+    words += _run_ocr(tmp2.name)
+    os.unlink(tmp2.name)
 
-    reader  = _get_reader()
-    results = reader.readtext(
-        tmp2_name,
-        rotation_info=[90, 180, 270],
-        paragraph=False,
-        text_threshold=0.5,
-        low_text=0.3,
-    )
-
-    words = []
-    for (bbox, text, conf) in results:
-        if conf > 0.3:
-            x = bbox[0][0]
-            y = bbox[0][1]
-            words.append({"text": _correct(text), "x": x, "y": y, "conf": conf})
-
-    # Nettoyage fichiers temp
-    os.unlink(tmp2_name)
-    if from_pdf:
-        os.unlink(img_path)
+    if raw_path:
+        os.unlink(raw_path)
 
     from .parser import parse_token
     items, seen = [], set()
@@ -118,16 +122,26 @@ def extract_from_image(path, from_pdf=False):
 
 
 def _correct(text):
-    import re
     t = text.strip()
+    # "1350" → "135°"
     m = re.match(r'^(\d{2,3})0$', t)
     if m:
         val = int(m.group(1))
         if 10 <= val <= 359:
             return f"{val}°"
+    # "8.2 H8" variantes OCR
     m = re.match(r'^(\d+\.?\d*)\s*[Hh]\s*[zZ]?(\d)$', t)
     if m:
         return f"{m.group(1)} H{m.group(2)}"
+    # "Ra 3.2" / "Ra3,2"
+    m = re.match(r'^[Rr][aAzZ]\s*(\d+\.?\d*)$', t)
+    if m:
+        prefix = t[:2].upper()
+        return f"{prefix}{m.group(1)}"
+    # "R 4.1" → "R4.1"
+    m = re.match(r'^[Rr]\s+(\d+\.?\d*)$', t)
+    if m:
+        return f"R{m.group(1)}"
     t = re.sub(r'[_]', '.', t)
     t = t.replace(',', '.')
     return t
