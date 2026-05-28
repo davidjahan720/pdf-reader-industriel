@@ -111,14 +111,25 @@ def extract_from_image(path, from_pdf=False):
         os.unlink(raw_path)
 
     from .parser import parse_token
-    items, seen = [], set()
+    items = []
     for w in sorted(words, key=lambda i: (i["y"]//30, i["x"])):
         item = parse_token(w["text"])
-        if item and item.get("label") not in seen:
-            seen.add(item["label"])
+        if item:
             item["x"], item["y"] = w["x"], w["y"]
-            items.append(item)
+            if not _is_near_duplicate(item, items):
+                items.append(item)
     return items
+
+
+def _is_near_duplicate(item, existing, threshold=80):
+    """Considère comme doublon : même label ET position proche (même zone du plan)."""
+    lbl = item.get("label")
+    x, y = item.get("x", 0), item.get("y", 0)
+    for e in existing:
+        if e.get("label") == lbl:
+            if abs(e.get("x", 0) - x) < threshold and abs(e.get("y", 0) - y) < threshold:
+                return True
+    return False
 
 
 def _correct(text):
