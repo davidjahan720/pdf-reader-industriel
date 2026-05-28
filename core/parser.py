@@ -63,4 +63,13 @@ def parse_token(t):
         v = float(m.group(1))
         if 0.5 <= v <= 9999:
             return {"type": "dim", "valeur": v, "label": str(int(v) if v==int(v) else v)}
+
+    # Valeur GD&T orpheline (sans symbole, mais avec datum) : "0.1 A", "0,1 AB", "0.05 A B"
+    m = re.match(r'^(\d+[\.,]?\d*)\s*([A-Z](?:\s*[A-Z]){0,2})$', t.replace(",", "."))
+    if m:
+        v = float(m.group(1))
+        if v <= 5.0:  # tolerance GD&T realiste
+            datum = re.sub(r'\s+', '', m.group(2))
+            return {"type": "gdt_value", "valeur": v, "datum": datum,
+                    "label": f"? {m.group(1)} {' '.join(datum)}"}
     return None
