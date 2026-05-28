@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.pyo
+debug_*.png
+*_rempli.xls
+*_rempli_rempli.xls
+.~lock.*
+*.lock
+.claude/
