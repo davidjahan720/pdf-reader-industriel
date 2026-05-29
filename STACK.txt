@@ -2,187 +2,289 @@
 STACK TECHNIQUE — PDF Reader / Extracteur de cotes
 =========================================================
 Projet   : Extraction de cotes depuis plans industriels
-Fichier  : app.py (interface) + ocr_engine.py (extraction)
-Date     : 2026-05-28
+Branche  : v2 (Tkinter + EasyOCR multi-passes)
+Repo     : github.com/davidjahan720/pdf-reader-industriel
+Date     : 2026-05-29
 =========================================================
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ARCHITECTURE GLOBALE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  app.py (Tkinter GUI)
+     │ appels in-process
+     ▼
+  core/
+     ├─ parser.py   classification token → type metier
+     ├─ pdf.py      PyMuPDF : texte vectoriel
+     ├─ dxf.py      ezdxf  : entites DIMENSION / TEXT
+     ├─ ocr.py      pipeline OCR multi-passes
+     └─ excel.py    remplissage PV de controle .xls
+
+  Strategie d'extraction (par ordre d'essai) :
+    1. PDF -> texte vectoriel (PyMuPDF)
+    2. Si vide -> rasterisation + pipeline OCR (core/ocr.py)
+    3. DXF -> entites dimensionnees (ezdxf)
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 COUCHE 1 — INTERFACE GRAPHIQUE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Tkinter              — GUI Python natif (fenêtre, boutons, treeview)
-ttk (themed widgets) — style Treeview, Combobox
-PIL / Pillow         — affichage image dans le canvas (ImageTk)
+tkinter / ttk        — GUI Python natif (fenetre, boutons, treeview, dialogs)
+Pillow (PIL.ImageTk) — affichage image dans Canvas
+threading            — analyse en thread daemon (UI reste reactive)
+
+Features GUI :
+  - Apercu PDF / image rendu via PyMuPDF
+  - Treeview cotes avec couleurs par type
+  - Clic droit : Ajouter / Modifier / Supprimer
+  - Timer visible sur le bouton "Analyser" pendant l'analyse
+  - Drag & drop fichier
+  - Statusbar avec messages d'erreur explicites
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 COUCHE 2 — LECTURE DE FICHIERS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-PyMuPDF (fitz)       — rasterisation PDF → image haute résolution
-                       pip install pymupdf
-ezdxf                — parsing DXF (entités DIMENSION, TEXT, MTEXT)
-                       pip install ezdxf
-PIL / Pillow         — ouverture images : PNG, JPG, TIFF, BMP, WEBP
-                       pip install Pillow
+PyMuPDF (fitz)       pip install pymupdf
+  - rasterisation PDF -> pixmap (zoom 5x = ~600 DPI equivalent)
+  - extraction texte vectoriel via page.get_text("words")
 
-Formats supportés :
-  .pdf    → rasterisé via PyMuPDF (200-600 dpi)
-  .dxf    → entités DIMENSION et TEXT extraites si présentes
-  .png    → OCR EasyOCR
-  .jpg    → OCR EasyOCR
-  .jpeg   → OCR EasyOCR
-  .tif    → OCR EasyOCR
-  .tiff   → OCR EasyOCR
-  .bmp    → OCR EasyOCR
-  .webp   → OCR EasyOCR
+ezdxf                pip install ezdxf
+  - parsing DXF, iteration modelspace
+  - entites supportees : DIMENSION (actual_measurement), TEXT, MTEXT
+  - limite : DXF 3D (3DSOLID/POINT/LINE/ARC) ne contient pas de cotes
+
+Pillow               pip install Pillow
+  - ouverture images : PNG, JPG, JPEG, TIF, TIFF, BMP, WEBP
+
+Formats supportes :
+  .pdf  -> texte vectoriel OU rasterise vers OCR
+  .dxf  -> entites DIMENSION/TEXT extraites
+  .png/.jpg/.tif/.bmp/.webp -> OCR direct
 
 Limites connues :
-  - PDF vectoriel (export CAO) : texte non extractible par pdfplumber/pymupdf
-    car les caractères sont des tracés vectoriels (paths), pas du texte encodé
-  - DXF 3D géométrique (ex : export SolidWorks Model) : pas d'entités DIMENSION
-    → seul un DXF Drawing (avec cotation) contient les dimensions
+  - PDF image (capture d'ecran de site web) : aucun texte vectoriel
+    -> bascule automatique sur OCR avec message d'avertissement
+  - DXF export modele 3D : aucune entite cotee
+  - Symboles GD&T graphiques (parallelisme, perpendicularite, planeite)
+    invisibles a l'OCR -> a completer manuellement
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-COUCHE 3 — PRÉTRAITEMENT IMAGE
+COUCHE 3 — PIPELINE OCR MULTI-PASSES (core/ocr.py)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-OpenCV (cv2)         — pipeline de prétraitement (Méthode A)
-                       pip install opencv-python
-NumPy                — manipulation tableaux image
-                       pip install numpy
 
-Pipeline (ocr_engine.py → preprocess_method_a) :
-  1. Upscale si largeur < 2500px (interpolation INTER_CUBIC)
-  2. Conversion en niveaux de gris
-  3. Deskew — correction inclinaison via Hough Lines (jusqu'à ±10°)
-  4. Denoise — fastNlMeansDenoising (filtre bruit scan)
-  5. CLAHE — contraste local adaptatif (tileGrid 8×8, clipLimit 2.0)
-  6. Seuillage adaptatif Gaussien (blockSize 31, C=10)
-  7. Dilation morphologique 2×2 — épaissit les traits fins vectoriels
+OpenCV (cv2)         pip install opencv-python
+NumPy                pip install numpy
+EasyOCR              pip install easyocr
+PyTorch              installe automatiquement avec easyocr
+
+Modeles EasyOCR (cache %USERPROFILE%/.EasyOCR/, ~150 MB) :
+  craft_mlt_25k.pth  — detection zones texte (CRAFT)
+  english_g2.pth     — reconnaissance anglais
+  french.pth         — reconnaissance francais
+
+Detection GPU :
+  torch.cuda.is_available() determine CPU vs GPU automatiquement
+  Affichage badge GPU/CPU dans l'UI
+
+  +--------------------+-------------------+
+  | Plateforme         | Temps bride.pdf   |
+  +--------------------+-------------------+
+  | CPU local (i7)     | ~130 s            |
+  | GPU NVIDIA A2 16GB | ~25-35 s (estime) |
+  +--------------------+-------------------+
+
+
+PIPELINE EN 4 PASSES :
+
+Passe 1 — OCR brut (zoom 5x)
+  reader.readtext(raw_image, rotation_info=[90,180,270],
+                  text_threshold=0.4, low_text=0.25)
+
+Passe 2 — OCR sur image pretraitee
+  pipeline : upscale 3000px -> grayscale -> deskew Hough -> denoise
+             -> CLAHE (clipLimit=2.0, 8x8) -> threshold adaptatif Gauss
+             -> dilation 2x2
+
+Passe 3 — OCR sur image sharpened
+  unsharp mask : addWeighted(gray, 1.8, gaussianBlur(gray,3), -0.8, 0)
+
+Passe 4 — OCR par tuiles 2x2 (recouvrement 20%)
+  Decoupe l'image en 4 quadrants, OCR chaque tuile separement
+  Re-mappe les coordonnees en espace image global
+  Objectif : capter petites annotations (ex : R4.1 que les passes
+             globales manquent)
+
+
+CONSOLIDATION (vote multi-passes) :
+
+Clustering positionnel single-link (threshold = 50 pixels)
+Pour chaque cluster, score par label :
+  1. nombre de detections (count multi-passes)
+  2. confiance moyenne
+  3. longueur du label
+  4. penalite pour entiers courts isoles
+
+Garde-fous :
+  - dim <= 9 sans decimale et det=1  -> rejete (bruit)
+  - dim <= 9 dans zone cartouche (y > 0.82*H) avec det<3 -> rejete
+  - Suppression des fragments OCR a meme position
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-COUCHE 4 — MOTEUR OCR PRINCIPAL : EasyOCR
+COUCHE 4 — CORRECTIONS POST-OCR (_correct)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-EasyOCR              — moteur OCR deep learning
-                       pip install easyocr
-PyTorch (torch)      — backend deep learning d'EasyOCR (CPU mode)
 
-Modèles téléchargés (~150MB, cache dans %USERPROFILE%/.EasyOCR/) :
-  craft_mlt_25k.pth  — détection de zones texte (CRAFT algorithm)
-  english_g2.pth     — reconnaissance caractères anglais
-  french.pth         — reconnaissance caractères français
-
-Paramètres d'appel :
-  languages          = ["fr", "en"]
-  gpu                = False (CPU uniquement)
-  rotation_info      = [90, 180, 270] — capture textes verticaux/inversés
-  paragraph          = False — mot par mot
-  text_threshold     = 0.5
-  low_text           = 0.3
-
-Avantages sur Tesseract pour plans techniques :
-  ✓ Gère les textes inclinés (ex : 8.2 H8 à 45°, 135°)
-  ✓ Combine tokens adjacents (ex : "40" + "H7" → "40 H7")
-  ✓ Meilleur taux de détection sur traits fins vectoriels
-  ✓ Confiance par résultat (filtrage bruit)
+Patterns connus :
+  "1350"       -> "135°"   (degre lu comme zero)
+  "8.2 Hz8"    -> "8.2 H8" (fit ISO mal decoupe)
+  "Ra 3,2"     -> "Ra3.2"  (rugosite)
+  "RZ7"        -> "Rz7"    (Z majuscule au lieu de minuscule)
+  "R 4.1"      -> "R4.1"   (rayon avec espace)
+  "R41"        -> "R4.1"   (heuristique : rayon a deux chiffres = decimal)
+  "X_Y"        -> "X.Y"    (underscore au lieu de point)
+  ","          -> "."      (decimale europeenne)
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-COUCHE 5 — MOTEUR OCR FALLBACK : Tesseract + multi-rotation
+COUCHE 5 — PARSER & CLASSIFICATION (core/parser.py)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Tesseract OCR 5.4    — moteur OCR classique (fallback si EasyOCR échoue)
-                       Installé via winget UB-Mannheim.TesseractOCR
-pytesseract          — wrapper Python pour Tesseract
-                       pip install pytesseract
 
-Méthode B — multi-zones × multi-PSM :
-  Zones  : full, top, bottom, right, left, top_right, mid_right
-  PSM    : 6 (bloc), 7 (ligne), 11 (sparse), 13 (raw line)
+re (regex Python natif)
 
-Méthode C — multi-rotation :
-  Angles : 0°, 45°, 90°, 135°, 270°, 315°
-  Objectif : capturer textes inclinés non lus à 0°
+Types reconnus :
+  dim         dimension simple        ex : 8, 10, 20, 11.5
+  iso_fit     ajustement ISO          ex : 40 H7, 8.2 H8, 25 h6
+  rayon       rayon                   ex : R4.1, R12
+  angle       angle                   ex : 135°, 45°
+  rugosite    etat de surface         ex : Ra3.2, Rz7
+  gdt         tolerance GD&T          ex : ⊕ 0.1 A B, ⏥ 0.1 A
+  gdt_value   valeur GD&T orpheline   ex : "0.1 A B" (sans symbole graphique)
 
+Heuristique GD&T (core/ocr.py / _merge_gdt_with_items) :
+  gdt_value detecte avec >= 2 datums  -> symbole ⊕ (position quasi-certain)
+  gdt_value detecte avec  = 1 datum   -> symbole ⏥ (planeite plus frequente)
+  Valeur 0.1 sans datum               -> non detecte (limite OCR)
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-COUCHE 6 — CLASSIFICATION ET ENRICHISSEMENT
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Python re (regex)    — classification des tokens OCR
-
-Types reconnus (parse_token dans app.py) :
-  dim        — dimension simple     ex : 8, 10, 20, 11.5
-  iso_fit    — ajustement ISO       ex : 40 H7, 8.2 H8, 25 h6
-  rayon      — rayon                ex : R4.1, R12
-  angle      — angle                ex : 135°, 45°
-  rugosite   — état de surface      ex : Ra3.2, Rz6.3
-  gdt        — tolérance GD&T       ex : ⊕ 0.1 A B, ∥ 0.1, ⏥ 0.1 A
-
-Post-traitement OCR (_correct dans ocr_engine.py) :
-  1350 → 135°   (° reconnu comme 0 en fin de nombre)
-  8H z8 → 8.2 H8 (fit ISO mal découpé)
-  R4_1 → R4.1   (underscore au lieu de point)
-  , → .          (décimale européenne)
-
-Table ISO 286 intégrée (source : reference_gdt.txt) :
+Table ISO 286 integree :
   Zones   : H6, H7, H8, H9, h6, h7, g6, f7
   Plages  : 0-3, 3-6, 6-10, 10-18, 18-30, 30-50, 50-80, 80-120, 120-180, 180-250 mm
-  Calcul  : ES et EI en mm avec signe (ex : H7 40mm → ES=+0.025, EI=+0)
+  Calcul  : ES (ecart superieur) et EI (ecart inferieur) en mm avec signe
+            ex : 40 H7 -> ES=+0.025, EI=+0
 
-GD&T symbols Unicode (source : reference_gdt.txt / ISO 1101) :
-  ⏥  planéité        ⊕  position       ∥  parallélisme
-  ⊥  perpendicularité ∠  angularité     ○  circularité
-  ⌭  cylindricité     ◎  concentricité  ≡  symétrie
-  ↗  battement        ↗↗ battement total
+Symboles GD&T Unicode (ISO 1101) :
+  ⏥  planeite          ⊕  position        ∥  parallelisme
+  ⊥  perpendicularite  ∠  angularite      ○  circularite
+  ⌭  cylindricite      ◎  concentricite   ≡  symetrie
+  ↗  battement         ↗↗ battement total
+  ⌒  profil de ligne   ⌓  profil de surface
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-COUCHE 7 — EXPORT EXCEL
+COUCHE 6 — EXPORT EXCEL (core/excel.py)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-xlrd                 — lecture fichier .xls avec formatage
-                       pip install xlrd
-xlwt                 — écriture fichier .xls
-                       pip install xlwt
-xlutils              — copie .xls en préservant styles/mise en forme
-                       pip install xlutils
 
-Structure du PV de contrôle :
-  Feuille Feuil1
-  L12-13  : en-têtes (Côtes à relever / Côtes relevées / Observation)
-  Col B   : côtes à relever → écriture à partir de B15 (row=14, base 0)
-  Col I   : OBSERVATION    → GD&T en JSON
-  Pas     : une ligne sur deux (cellules fusionnées)
+xlrd                 pip install xlrd
+xlwt                 pip install xlwt
+xlutils              pip install xlutils
 
-Format JSON OBSERVATION (GD&T) :
-  {"symbole": "⊕", "valeur": 0.1, "datum": "AB", "cadre": true}
+Strategie : copie de la template .xls (preservant styles + cellules
+            fusionnees) via xlutils.copy.copy, puis ecriture des cellules
+            par ws.write.
+
+Structure du PV de controle (Feuil1) :
+  L12-13   en-tetes
+  Col B    cote nominale       ecriture a partir de B15 (row=14, base 0)
+  Col C    tolerances ES / EI  (iso_fit uniquement, 2 lignes)
+  Col I    OBSERVATION         (vide en v2)
+  Pas      une ligne sur deux (cellules fusionnees)
+
+Conventions de format :
+  iso_fit  -> col B "40 H7", col C ligne N ES, ligne N+1 EI
+  rugosite -> col B "Ra 3,2" (espace + virgule decimale)
+  gdt      -> col B label complet avec symbole Unicode
+  dim/rayon/angle -> col B label tel quel
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CONFIDENTIALITE / RGPD
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Aucune persistance des plans :
+  - PDF lu en lecture seule, jamais copie
+  - Pixmaps temporaires dans %TEMP% -> os.unlink immediat en finally
+  - Tuiles OCR temporaires -> os.unlink immediat
+  - Resultats uniquement en RAM (self.items)
+  - Pas de cache disque, pas de logs, pas de base de donnees
+
+A la fermeture de l'application : aucune trace residuelle.
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FICHIERS DU PROJET
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-app.py               — interface graphique principale (Tkinter)
-ocr_engine.py        — pipeline OCR : EasyOCR + Tesseract fallback
-extract_cotes.py     — script CLI (sans GUI, données bride hardcodées)
-ocr_extract.py       — ancienne version Tesseract seul (archivé)
-vision_extract.py    — version Claude Vision API (nécessite ANTHROPIC_API_KEY)
-STACK.txt            — ce fichier
-reference_gdt.txt    — table ISO 286 + symboles GD&T (C:\Users\David\Desktop)
-.claude/claude.md    — contexte projet pour Claude Code
+
+Actifs (v2) :
+  app.py               interface graphique principale (Tkinter)
+  core/__init__.py     init du package
+  core/parser.py       classification token + table ISO 286
+  core/pdf.py          extraction texte vectoriel PyMuPDF
+  core/dxf.py          parsing DXF ezdxf
+  core/ocr.py          pipeline OCR multi-passes EasyOCR
+  core/excel.py        ecriture .xls avec xlutils
+  requirements.txt     dependances pip
+  STACK.txt            ce fichier
+  INSTALL_SERVER.md    guide installation serveur GPU
+  .claude/claude.md    contexte projet pour Claude Code
+
+Conserves mais non utilises en v2 :
+  main.py              API FastAPI (variante serveur)
+  static/index.html    frontend web pour main.py
+
+Archives (ancienne v1) :
+  ocr_engine.py        ancien moteur Tesseract + EasyOCR combine
+  extract_cotes.py     ancien script CLI
+  ocr_extract.py       ancien Tesseract seul
+  vision_extract.py    ancien client Claude Vision API
+  test_*.py            anciens tests d'investigation
+  Lancer extracteur.bat ancien lanceur Windows
 
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-INSTALLATION COMPLÈTE (environnement vierge)
+INSTALLATION (environnement vierge)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-pip install pymupdf pdfplumber ezdxf Pillow opencv-python
-pip install pytesseract xlrd xlwt xlutils
-pip install easyocr
-winget install UB-Mannheim.TesseractOCR --source winget
 
-Taille totale estimée (modèles inclus) :
-  Packages Python    ~800 MB (PyTorch via easyocr)
-  Modèles EasyOCR    ~150 MB (cache %USERPROFILE%/.EasyOCR/)
-  Tesseract          ~50 MB
+Pre-requis : Python 3.11+ recommande
 
-Lancement :
+  pip install -r requirements.txt
+
+Ou explicitement :
+  pip install pymupdf ezdxf Pillow opencv-python numpy
+  pip install xlrd xlwt xlutils
+  pip install easyocr
+
+Note : easyocr installe PyTorch (~800 MB) automatiquement.
+Les modeles EasyOCR (~150 MB) se telechargent au premier lancement
+dans %USERPROFILE%/.EasyOCR/ (Windows) ou ~/.EasyOCR/ (Linux).
+
+Pour le GPU (serveur A2) :
+  Installer CUDA Toolkit 11.8 ou 12.x compatible PyTorch
+  Reinstaller torch avec : pip install torch --index-url
+                            https://download.pytorch.org/whl/cu121
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LANCEMENT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
   python app.py
+
+L'application s'ouvre, charger un PDF/DXF/image via "Ouvrir plan",
+puis cliquer "Analyser". Le timer s'affiche sur le bouton pendant
+l'OCR (~130s sur CPU). Exporter vers Excel via "Exporter Excel"
+apres avoir selectionne la template PV de controle.
+
 =========================================================
